@@ -1,0 +1,361 @@
+// ====================================================
+// LUMINÁRIA TEMPORIZADORA DINÂMICA - MODELO 3 BOTÕES
+// ULTIMA VERSÃO:
+// 1. LEDs de tempo desligados quando o sistema está OFF.
+// 2. LEDs de tempo acendem fixos no modo seleção.
+// 3. LED de tempo pisca 10 vezes ao INICIAR o timer e depois fica FIXO.
+// 4. Servo motor se move com velocidade controlada (varredura).
+// ====================================================
+
+#include <Servo.h>
+Servo servoMotor;
+
+// ----------------------------------------------------
+// 1. DEFINIÇÃO DE PINOS E CONSTANTES
+// ----------------------------------------------------
+
+// Pinos de Saída (Atuadores)
+const int LED_PRINCIPAL_PIN = 9;  // LED Principal (Saída via MOSFET/Transistor)
+const int BUZZER_PIN = 10;     // Buzzer para avisos sonoros
+const int MOTOR_PIN = 11;      // Pino de controle do Servo Motor
+
+// Pinos de Entrada (Botões) - Usamos INPUT_PULLUP
+const int LIGA_DESLIGA_PIN = 2;  // Botão Liga/Desliga (Lateral)
+const int INICIAR_CANCELAR_PIN = 3; // Botão Iniciar/Cancelar
+const int SELECIONAR_TEMPO_PIN = 4; // ÚNICO Botão para ciclar a seleção de tempo
+
+// Pinos dos Mini LEDs de indicação (frontais)
+const int MINI_LED_PINS[] = {A0, A1, A2, A3, A4}; 
+const int NUM_TEMPOS = 5; 
+
+// Ângulos do Servo Motor (Ajuste conforme sua mecânica)
+const int ANGULO_FECHADO = 90;   
+const int ANGULO_PARCIAL = 45;   
+const int ANGULO_ABERTO = 0;   
+
+// Tempos em Milissegundos (10, 20, 30, 40, 50 minutos)
+const unsigned long TEMPO_MS[] = {
+  10UL * 60 * 1000, 
+  20UL * 60 * 1000, 
+  30UL * 60 * 1000, 
+  40UL * 60 * 1000, 
+  50UL * 60 * 1000 
+};
+
+const unsigned long AVISO_2_MIN_MS = 2UL * 60 * 1000; // 2 minutos para o aviso
+const int TEMPO_MIN[] = {10, 20, 30, 40, 50}; // Valores em minutos para log
+
+// CONSTANTE PARA O CONTROLE DE VELOCIDADE DO SERVO
+const int INTERVALO_VARREDURA_MS = 10; // Tempo em ms entre cada passo de 1 grau (Controla a velocidade)
+
+// ----------------------------------------------------
+// 2. VARIÁVEIS DE ESTADO
+// ----------------------------------------------------
+
+bool sistemaLigado = false;
+bool timerAtivo = false;
+int tempoSelecionadoIndex = 0; 
+unsigned long tempoInicioTimer = 0; 
+unsigned long duracaoTimer = TEMPO_MS[0]; 
+int anguloAtualServo = ANGULO_FECHADO; 
+bool avisoParcialDado = false; 
+
+// Variáveis de debounce e log 
+unsigned long ultimoLogTempo = 0; 
+unsigned long ultimoBotaoTime = 0;
+const long debounceDelay = 50; 
+
+// Variáveis para o Pisca-Pisca do LED Selecionado
+unsigned long blinkMillis = 0;
+const int BLINK_INTERVAL = 200; // 200ms
+bool ledEstado = false; // Estado atual do LED (ON/OFF)
+
+// VARIÁVEIS PARA O NOVO CONTROLE DE PISCA-PISCA (10 vezes)
+int blinkCount = 0; // Contador de trocas de estado (2 trocas = 1 piscada)
+const int MAX_BLINKS = 10; // Total de piscadas
+const int MAX_BLINKS_COUNT = MAX_BLINKS * 2; // Total de trocas de estado para 10 piscadas
+
+// ----------------------------------------------------
+// 3. FUNÇÕES DE CONTROLE
+// ----------------------------------------------------
+
+// Move o servo com varredura (velocidade controlada)
+void moverLuminaria(int anguloFinal) {
+    if (anguloAtualServo != anguloFinal) {
+        
+        int passo = 1; // Mover 1 grau por vez
+        if (anguloFinal < anguloAtualServo) {
+            passo = -1; // Se o ângulo final for menor, o passo é negativo (voltando)
+        }
+
+        Serial.print("LOG::Iniciando varredura para o angulo: ");
+        Serial.print(anguloFinal);
+        Serial.print(" (Velocidade: ");
+        Serial.print(INTERVALO_VARREDURA_MS);
+        Serial.println("ms/grau)");
+
+
+        // Varre o ângulo atual até o ângulo final, um grau de cada vez
+        for (int a = anguloAtualServo; a != anguloFinal; a += passo) {
+            servoMotor.write(a);
+            anguloAtualServo = a; // Atualiza a variável de controle
+            // Controla a velocidade (quanto maior o valor, mais lento)
+            delay(INTERVALO_VARREDURA_MS); 
+        }
+
+        // Garante que o servo chegue exatamente no ângulo final
+        servoMotor.write(anguloFinal);
+        anguloAtualServo = anguloFinal;
+        
+        Serial.print("LOG::Servo PAROU no angulo: ");
+        Serial.println(anguloFinal);
+    }
+}
+
+
+// Reinicia o sistema para o estado 'desligado' 
+void resetarSistema() {
+  Serial.println("--- LOG::SISTEMA DESLIGADO/RESETADO INICIADO ---");
+  sistemaLigado = false;
+  timerAtivo = false;
+  tempoSelecionadoIndex = 0; // Volta para o primeiro tempo (10 min)
+  duracaoTimer = TEMPO_MS[0];
+  avisoParcialDado = false; 
+    blinkCount = 0; // Reseta o contador de piscadas
+  
+  digitalWrite(LED_PRINCIPAL_PIN, LOW);
+  Serial.println("LOG::LED Principal: OFF.");
+  
+  moverLuminaria(ANGULO_FECHADO); 
+  
+  // Apaga todos os mini LEDs
+  for (int i = 0; i < NUM_TEMPOS; i++) {
+    digitalWrite(MINI_LED_PINS[i], LOW);
+  }
+  Serial.println("--- LOG::SISTEMA DESLIGADO/RESETADO CONCLUÍDO ---");
+}
+
+// Emite um bipe de 150ms
+void emitirBipe() {
+  tone(BUZZER_PIN, 1000, 150); 
+  Serial.println("LOG::Bipe emitido.");
+}
+
+// Função não bloqueante para o pisca-pisca do LED selecionado (AGORA LIMITADO A 10 VEZES)
+void gerenciarBlink() {
+    // Pisca APENAS se o timer estiver ativo E AINDA NÃO ATINGIU O LIMITE
+  if (timerAtivo) {
+    if (blinkCount < MAX_BLINKS_COUNT) { 
+            // Se ainda está na fase de piscar (10 vezes)
+      if (millis() - blinkMillis >= BLINK_INTERVAL) {
+        blinkMillis = millis();
+        ledEstado = !ledEstado; // Inverte o estado (metade da piscada)
+        digitalWrite(MINI_LED_PINS[tempoSelecionadoIndex], ledEstado);
+                blinkCount++; // Conta a troca de estado
+        
+        // Se o contador atingir o limite, garante que o LED fique HIGH (Aceso)
+                if (blinkCount >= MAX_BLINKS_COUNT) {
+                    digitalWrite(MINI_LED_PINS[tempoSelecionadoIndex], HIGH);
+                    Serial.println("LOG::Pisca-pisca de inicializacao concluido (10 vezes). LED Fixo.");
+                }
+      }
+    } else {
+             // Se já piscou 10 vezes, mantém o LED fixo HIGH (Aceso)
+             digitalWrite(MINI_LED_PINS[tempoSelecionadoIndex], HIGH);
+        }
+  } else if (sistemaLigado) {
+    // Se o timer não está ativo mas o sistema está ligado (modo seleção),
+    // garante que o LED selecionado fique LIGADO (Fixo)
+    digitalWrite(MINI_LED_PINS[tempoSelecionadoIndex], HIGH);
+    
+  }
+}
+
+// ----------------------------------------------------
+// 4. SETUP
+// ----------------------------------------------------
+
+void setup() {
+  Serial.begin(9600); 
+  Serial.println("==================================================");
+  Serial.println("--- INICIANDO LUMINARIA TEMPORIZADORA DINAMICA ---");
+  Serial.println("==================================================");
+  
+  // Configurações de Saída e Entrada
+  pinMode(LED_PRINCIPAL_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  for (int i = 0; i < NUM_TEMPOS; i++) {
+    pinMode(MINI_LED_PINS[i], OUTPUT);
+  }
+
+  pinMode(LIGA_DESLIGA_PIN, INPUT_PULLUP);
+  pinMode(INICIAR_CANCELAR_PIN, INPUT_PULLUP);
+  pinMode(SELECIONAR_TEMPO_PIN, INPUT_PULLUP); 
+
+  servoMotor.attach(MOTOR_PIN);
+  resetarSistema(); 
+}
+
+// ----------------------------------------------------
+// 5. LOOP PRINCIPAL
+// ----------------------------------------------------
+
+void loop() {
+  
+  // 5.1. Debounce para leitura de botões
+  bool checarBotoes = false;
+  if ((millis() - ultimoBotaoTime) >= debounceDelay) {
+    checarBotoes = true;
+    ultimoBotaoTime = millis();
+  }
+  
+  // 5.2. LIGA/DESLIGA GERAL
+  if (checarBotoes && digitalRead(LIGA_DESLIGA_PIN) == LOW) { 
+    if (sistemaLigado) {
+      Serial.println("LOG::Botao LIGA/DESLIGA: Pressionado para DESLIGAR.");
+      resetarSistema(); 
+    } else {
+      Serial.println("LOG::Botao LIGA/DESLIGA: Pressionado para LIGAR.");
+      sistemaLigado = true;
+    
+      
+      
+      // Acende o LED do tempo inicial ao LIGAR o sistema (Fixo)
+      digitalWrite(MINI_LED_PINS[tempoSelecionadoIndex], HIGH); 
+      
+      Serial.println("LOG::Sistema LIGADO. LED Principal e tempo padrão (10 min) ON.");
+      moverLuminaria(ANGULO_ABERTO); 
+        delay(400);
+      digitalWrite(LED_PRINCIPAL_PIN, HIGH);
+    }
+    while (digitalRead(LIGA_DESLIGA_PIN) == LOW); 
+  }
+
+  if (!sistemaLigado) {
+    return; 
+  }
+  
+  // Chama a função para controlar o pisca-pisca (não bloqueante)
+  gerenciarBlink(); 
+  
+  // ----------------------------------------------------
+  // 5.3. LÓGICA DO TIMER ATIVO (Contagem e Avisos)
+  // ----------------------------------------------------
+  
+  if (timerAtivo) {
+
+    unsigned long tempoDecorrido = millis() - tempoInicioTimer;
+    
+    // A. FIM DO TEMPORIZADOR
+    if (tempoDecorrido >= duracaoTimer) {
+      Serial.println("@@@ FIM DO TEMPORIZADOR ATINGIDO @@@");
+      emitirBipe();
+      delay(150); 
+      emitirBipe(); 
+      resetarSistema(); 
+      return; 
+    }
+    
+    long tempoRestante = duracaoTimer - tempoDecorrido; 
+
+    // B. LOG DE TEMPO DEPURADO (A CADA 1 SEGUNDO)
+    if (millis() - ultimoLogTempo >= 1000) { 
+      long segundosRestantes = tempoRestante / 1000;
+      if (segundosRestantes < 0) segundosRestantes = 0; 
+      
+      int minutos = segundosRestantes / 60;
+      int segundos = segundosRestantes % 60;
+
+      Serial.print(">>> Tempo Restante (");
+      Serial.print(TEMPO_MIN[tempoSelecionadoIndex]);
+      Serial.print(" min): ");
+      if (minutos < 10) Serial.print("0");
+      Serial.print(minutos);
+      Serial.print(":");
+      if (segundos < 10) Serial.print("0");
+      Serial.println(segundos);
+      
+      ultimoLogTempo = millis();
+    }
+    
+    // C. AVISO DE 2 MINUTOS
+    if (tempoRestante <= AVISO_2_MIN_MS && duracaoTimer > AVISO_2_MIN_MS && !avisoParcialDado) {
+      Serial.println("LOG::AVISO: 2 minutos restantes! Fechando Parcialmente.");
+      moverLuminaria(ANGULO_PARCIAL);
+      avisoParcialDado = true;
+    }
+    
+  }
+  
+  // ----------------------------------------------------
+  // 5.4. BOTÃO DE SELEÇÃO DE TEMPO (Ciclo - Pin 4)
+  // ----------------------------------------------------
+  if (checarBotoes && digitalRead(SELECIONAR_TEMPO_PIN) == LOW) {
+    
+    // A. Se o timer estiver ativo, CANCELA a contagem e fecha o motor
+    if (timerAtivo) {
+      Serial.println("LOG::Timer ativo, CANCELANDO a contagem e fechando motor antes de mudar o tempo.");
+      timerAtivo = false;
+            blinkCount = 0; // Reseta o contador se o timer for cancelado
+      moverLuminaria(ANGULO_FECHADO); 
+    }
+
+    // Desliga o LED anterior antes de mudar o índice.
+    digitalWrite(MINI_LED_PINS[tempoSelecionadoIndex], LOW);
+    
+    // B. Avança para o próximo tempo (Ciclo)
+    tempoSelecionadoIndex++;
+    if (tempoSelecionadoIndex >= NUM_TEMPOS) {
+      tempoSelecionadoIndex = 0;
+    }
+    
+    // C. Atualiza e acende o novo LED (Fixo - modo seleção)
+    duracaoTimer = TEMPO_MS[tempoSelecionadoIndex];
+    digitalWrite(MINI_LED_PINS[tempoSelecionadoIndex], HIGH); 
+    ledEstado = true; 
+    
+    // D. Feedback e Log
+    emitirBipe();
+    Serial.print("LOG::Novo tempo SELECIONADO: ");
+    Serial.print(TEMPO_MIN[tempoSelecionadoIndex]);
+    Serial.println(" minutos.");
+    
+    while (digitalRead(SELECIONAR_TEMPO_PIN) == LOW);
+  }
+  
+  // ----------------------------------------------------
+  // 5.5. BOTÃO INICIAR/CANCELAR (Pin 3)
+  // ----------------------------------------------------
+  if (checarBotoes && digitalRead(INICIAR_CANCELAR_PIN) == LOW) {
+    
+    if (timerAtivo) {
+      // A. Timer Ativo: CANCELA
+      Serial.println("LOG::Botao INICIAR/CANCELAR: Pressionado para CANCELAR.");
+      emitirBipe();
+      timerAtivo = false;
+            blinkCount = 0; // Reseta o contador ao cancelar
+      moverLuminaria(ANGULO_FECHADO); 
+    
+    } else {
+      // B. Timer Inativo: INICIA
+      Serial.println("LOG::Botao INICIAR/CANCELAR: Pressionado para INICIAR.");
+      
+      timerAtivo = true;
+      tempoInicioTimer = millis();
+      ultimoLogTempo = millis(); 
+      avisoParcialDado = false;
+      emitirBipe();
+      moverLuminaria(ANGULO_ABERTO); 
+      
+      ledEstado = true; // Garante que o blink comece do estado ON
+      blinkMillis = millis(); // Reseta o contador do blink
+            blinkCount = 0; // INICIA o contador de piscadas
+      
+      Serial.print("LOG::Contagem INICIADA para ");
+      Serial.print(TEMPO_MIN[tempoSelecionadoIndex]);
+      Serial.println(" minutos.");
+    }
+
+    while (digitalRead(INICIAR_CANCELAR_PIN) == LOW); 
+  }
+}
