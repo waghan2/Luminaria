@@ -58,4 +58,5 @@ O código utiliza um loop não bloqueante (`millis()`) para controlar o *countdo
 * **Tempos Padrão:** $10, 20, 30, 40, 50$ minutos.
 * **Velocidade do Servo:** Controlada pela constante `INTERVALO_VARREDURA_MS = 10`, que define o atraso em milissegundos a cada passo de $1^\circ$ de movimento.
 * **Log de Debug:** O tempo restante é impresso no Monitor Serial (9600 baud) a cada **1 segundo**.
-```eof
+<img width="749" height="518" alt="image" src="https://github.com/user-attachments/assets/a2b371da-b369-40c5-9af4-d3f63ccdacd9" />
+
